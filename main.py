@@ -35,6 +35,7 @@ COUNTRIES = [
 ]
 
 TARGET = "8.8.8.8"
+HTTP_TARGET = "https://www.google.com"
 SEMAPHORE = asyncio.Semaphore(5)
 
 async def run_ping_from_country(client: httpx.AsyncClient, country_code: str):
@@ -79,6 +80,7 @@ async def run_ping_from_country(client: httpx.AsyncClient, country_code: str):
 
 @app.get("/api/mtr")
 async def run_mtr(country_code: str):
+    """MTR: حذف measurementOptions برای جلوگیری از خطای اعتبارسنجی"""
     async with httpx.AsyncClient() as client:
         try:
             create_resp = await client.post(
@@ -88,13 +90,15 @@ async def run_mtr(country_code: str):
                     "type": "mtr",
                     "locations": [{"country": country_code}],
                     "limit": 1,
+                    # بدون measurementOptions، API از مقادیر پیش‌فرض استفاده می‌کند
                 },
                 timeout=10.0,
             )
             if create_resp.status_code != 202:
-                return JSONResponse({"error": "Failed to create MTR"}, status_code=400)
+                err = create_resp.text
+                return JSONResponse({"error": f"Create failed: {err}"}, status_code=400)
             mid = create_resp.json()["id"]
-            for _ in range(15):
+            for _ in range(20):
                 await asyncio.sleep(1.0)
                 get_resp = await client.get(
                     f"https://api.globalping.io/v1/measurements/{mid}",
@@ -108,6 +112,51 @@ async def run_mtr(country_code: str):
                             hops = results[0].get("result", {}).get("hops", [])
                             return JSONResponse({"hops": hops, "measurement_id": mid})
             return JSONResponse({"error": "MTR timeout"}, status_code=408)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/api/http")
+async def run_http(country_code: str):
+    """HTTP: دریافت زمان‌بندی کامل Total، DNS، TCP، TLS، First Byte، Download"""
+    async with httpx.AsyncClient() as client:
+        try:
+            create_resp = await client.post(
+                "https://api.globalping.io/v1/measurements",
+                json={
+                    "target": HTTP_TARGET,
+                    "type": "http",
+                    "locations": [{"country": country_code}],
+                    "limit": 1,
+                    "measurementOptions": {
+                        "protocol": "HTTPS",
+                        "request": {"method": "GET"}
+                    }
+                },
+                timeout=10.0,
+            )
+            if create_resp.status_code != 202:
+                err = create_resp.text
+                return JSONResponse({"error": f"Create failed: {err}"}, status_code=400)
+            mid = create_resp.json()["id"]
+            for _ in range(15):
+                await asyncio.sleep(1.0)
+                get_resp = await client.get(
+                    f"https://api.globalping.io/v1/measurements/{mid}",
+                    timeout=10.0,
+                )
+                if get_resp.status_code == 200:
+                    data = get_resp.json()
+                    if data.get("status") == "finished":
+                        results = data.get("results", [])
+                        if results:
+                            timings = results[0].get("result", {}).get("timings", {})
+                            status = results[0].get("result", {}).get("statusCode", "N/A")
+                            return JSONResponse({
+                                "timings": timings,
+                                "statusCode": status,
+                                "measurement_id": mid
+                            })
+            return JSONResponse({"error": "HTTP timeout"}, status_code=408)
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -146,7 +195,7 @@ async def dashboard():
             <tr data-code="{r['code']}" data-name="{r['name']}">
                 <td class="name">{r['name']}</td><td class="loss na">N/A</td>
                 <td class="lat">-</td><td class="lat">-</td><td class="lat">-</td>
-                <td class="actions"><button class="mtr-btn" disabled>MTR</button></td>
+                <td class="actions"><button class="mtr-btn" disabled>MTR</button><button class="http-btn" disabled>HTTP</button></td>
             </tr>"""
         else:
             lv = r["loss"]
@@ -161,6 +210,7 @@ async def dashboard():
                 <td class="lat">{r['max'] if r['max'] is not None else '-'}</td>
                 <td class="actions">
                     <button class="mtr-btn" data-code="{r['code']}" data-name="{r['name']}">MTR</button>
+                    <button class="http-btn" data-code="{r['code']}" data-name="{r['name']}">HTTP</button>
                     <a href="{share_link}" target="_blank" class="share-btn">↗</a>
                 </td>
             </tr>"""
@@ -218,14 +268,13 @@ async def dashboard():
             .loss.high {{ color: #ef4444; }} .loss.med {{ color: #eab308; }} .loss.low {{ color: #22c55e; }} .loss.na {{ color: #404040; }}
             .lat {{ font-family: 'JetBrains Mono', monospace; color: #737373; font-size: 0.72rem; }}
             .actions {{ display: flex; gap: 0.3rem; }}
-            .mtr-btn {{ background: #1a1a1a; border: 1px solid #2a2a2a; color: #a3a3a3; padding: 0.15rem 0.4rem; border-radius: 4px; font-size: 0.65rem; cursor: pointer; }}
-            .mtr-btn:hover:not(:disabled) {{ border-color: #60a5fa; color: #60a5fa; }}
-            .mtr-btn:disabled {{ opacity: 0.3; cursor: not-allowed; }}
+            .mtr-btn, .http-btn {{ background: #1a1a1a; border: 1px solid #2a2a2a; color: #a3a3a3; padding: 0.15rem 0.4rem; border-radius: 4px; font-size: 0.65rem; cursor: pointer; }}
+            .mtr-btn:hover:not(:disabled), .http-btn:hover:not(:disabled) {{ border-color: #60a5fa; color: #60a5fa; }}
+            .mtr-btn:disabled, .http-btn:disabled {{ opacity: 0.3; cursor: not-allowed; }}
             .share-btn {{ background: none; border: 1px solid #2a2a2a; color: #525252; padding: 0.15rem 0.35rem; border-radius: 4px; font-size: 0.7rem; text-decoration: none; }}
             .share-btn:hover {{ border-color: #60a5fa; color: #60a5fa; }}
             .table-wrap::-webkit-scrollbar {{ width: 4px; }} .table-wrap::-webkit-scrollbar-thumb {{ background: #262626; }}
             .note {{ font-size: 0.65rem; color: #404040; margin-top: 0.75rem; font-family: 'JetBrains Mono', monospace; }}
-            /* Modal */
             .modal-bg {{ display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 100; justify-content: center; align-items: center; }}
             .modal-bg.active {{ display: flex; }}
             .modal {{ background: #161616; border: 1px solid #2a2a2a; border-radius: 12px; width: 90%; max-width: 800px; max-height: 80vh; display: flex; flex-direction: column; }}
@@ -238,6 +287,11 @@ async def dashboard():
             .hop-table td {{ padding: 0.4rem 0.3rem; border-bottom: 1px solid #1a1a1a; font-family: 'JetBrains Mono', monospace; color: #a3a3a3; }}
             .hop-table .loss-cell {{ font-weight: 600; }}
             .hop-table .loss-cell.high {{ color: #ef4444; }} .hop-table .loss-cell.med {{ color: #eab308; }} .hop-table .loss-cell.low {{ color: #22c55e; }}
+            .hop-table .bottleneck {{ background: rgba(239,68,68,0.1); }}
+            .http-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.75rem; margin-bottom: 1rem; }}
+            .http-card {{ background: #121212; border: 1px solid #262626; border-radius: 8px; padding: 0.75rem 1rem; }}
+            .http-card .label {{ font-size: 0.6rem; color: #525252; text-transform: uppercase; letter-spacing: 1px; }}
+            .http-card .value {{ font-size: 1.1rem; font-weight: 600; font-family: 'JetBrains Mono', monospace; color: #f5f5f5; margin-top: 0.2rem; }}
             .spinner {{ text-align: center; color: #525252; padding: 2rem; }}
             @media (max-width: 1200px) {{ .main {{ grid-template-columns: 1fr 1fr; }} .panel.radar {{ grid-column: span 2; }} .stats {{ grid-template-columns: repeat(2,1fr); }} }}
             @media (max-width: 800px) {{ body {{ overflow: auto; }} .app {{ height: auto; min-height: 100vh; }} .main {{ grid-template-columns: 1fr; }} .panel.radar {{ grid-column: span 1; min-height: 320px; }} .panel {{ min-height: 280px; }} header {{ flex-direction: column; height: auto; padding: 0.75rem 1rem; gap: 0.5rem; }} .stats {{ grid-template-columns: repeat(2,1fr); }} .filters {{ flex-wrap: wrap; }} }}
@@ -278,7 +332,7 @@ async def dashboard():
                             <tbody id="tableBody">{table_rows}</tbody>
                         </table>
                     </div>
-                    <p class="note">Click MTR for hop-by-hop diagnosis · Share opens Globalping result</p>
+                    <p class="note">MTR: hop-by-hop · HTTP: full timing breakdown</p>
                 </div>
             </div>
         </div>
@@ -286,6 +340,12 @@ async def dashboard():
             <div class="modal">
                 <div class="modal-header"><h3 id="modalTitle">MTR</h3><button onclick="closeModal()">✕</button></div>
                 <div class="modal-body" id="modalBody"><div class="spinner">Running MTR...</div></div>
+            </div>
+        </div>
+        <div class="modal-bg" id="httpModal">
+            <div class="modal">
+                <div class="modal-header"><h3 id="httpTitle">HTTP Timings</h3><button onclick="closeHttpModal()">✕</button></div>
+                <div class="modal-body" id="httpBody"><div class="spinner">Running HTTP test...</div></div>
             </div>
         </div>
         <script>
@@ -318,10 +378,10 @@ async def dashboard():
                 }});
                 const tbody = document.getElementById('tableBody');
                 tbody.innerHTML = filtered.map(r => {{
-                    if (r.loss === null) return `<tr data-code="${{r.code}}" data-name="${{r.name}}"><td class="name">${{r.name}}</td><td class="loss na">N/A</td><td class="lat">-</td><td class="lat">-</td><td class="lat">-</td><td class="actions"><button class="mtr-btn" disabled>MTR</button></td></tr>`;
+                    if (r.loss === null) return `<tr data-code="${{r.code}}" data-name="${{r.name}}"><td class="name">${{r.name}}</td><td class="loss na">N/A</td><td class="lat">-</td><td class="lat">-</td><td class="lat">-</td><td class="actions"><button class="mtr-btn" disabled>MTR</button><button class="http-btn" disabled>HTTP</button></td></tr>`;
                     const cls = r.loss > 20 ? 'high' : (r.loss > 5 ? 'med' : 'low');
                     const share = r.share_id ? `https://globalping.io?measurement=${{r.share_id}}` : '#';
-                    return `<tr data-code="${{r.code}}" data-name="${{r.name}}"><td class="name">${{r.name}}</td><td class="loss ${{cls}}">${{r.loss.toFixed(1)}}%</td><td class="lat">${{r.min !== null ? r.min : '-'}}</td><td class="lat">${{r.avg !== null ? r.avg : '-'}}</td><td class="lat">${{r.max !== null ? r.max : '-'}}</td><td class="actions"><button class="mtr-btn" data-code="${{r.code}}" data-name="${{r.name}}">MTR</button><a href="${{share}}" target="_blank" class="share-btn">↗</a></td></tr>`;
+                    return `<tr data-code="${{r.code}}" data-name="${{r.name}}"><td class="name">${{r.name}}</td><td class="loss ${{cls}}">${{r.loss.toFixed(1)}}%</td><td class="lat">${{r.min !== null ? r.min : '-'}}</td><td class="lat">${{r.avg !== null ? r.avg : '-'}}</td><td class="lat">${{r.max !== null ? r.max : '-'}}</td><td class="actions"><button class="mtr-btn" data-code="${{r.code}}" data-name="${{r.name}}">MTR</button><button class="http-btn" data-code="${{r.code}}" data-name="${{r.name}}">HTTP</button><a href="${{share}}" target="_blank" class="share-btn">↗</a></td></tr>`;
                 }}).join('');
                 const validFiltered = filtered.filter(r => r.loss !== null);
                 buildRadar(validFiltered.map(r => r.name), validFiltered.map(r => r.loss));
@@ -329,11 +389,14 @@ async def dashboard():
                 buildBar(top.map(r => r.name), top.map(r => r.loss));
                 document.getElementById('visibleCount').textContent = `${{filtered.length}} shown`;
                 document.getElementById('tableCount').textContent = filtered.length;
-                attachMtrListeners();
+                attachListeners();
             }}
-            function attachMtrListeners() {{
+            function attachListeners() {{
                 document.querySelectorAll('.mtr-btn:not(:disabled)').forEach(btn => {{
                     btn.onclick = () => runMtr(btn.dataset.code, btn.dataset.name);
+                }});
+                document.querySelectorAll('.http-btn:not(:disabled)').forEach(btn => {{
+                    btn.onclick = () => runHttp(btn.dataset.code, btn.dataset.name);
                 }});
             }}
             async function runMtr(code, name) {{
@@ -341,25 +404,61 @@ async def dashboard():
                 const title = document.getElementById('modalTitle');
                 const body = document.getElementById('modalBody');
                 title.textContent = `MTR from ${{name}} to {TARGET}`;
-                body.innerHTML = '<div class="spinner">Running MTR... This may take up to 15s.</div>';
+                body.innerHTML = '<div class="spinner">Running MTR... This may take up to 20s.</div>';
                 modal.classList.add('active');
                 try {{
                     const resp = await fetch(`/api/mtr?country_code=${{code}}`);
                     const data = await resp.json();
                     if (data.error) {{ body.innerHTML = `<div class="spinner">Error: ${{data.error}}</div>`; return; }}
                     if (!data.hops || data.hops.length === 0) {{ body.innerHTML = '<div class="spinner">No hops returned.</div>'; return; }}
-                    let html = '<table class="hop-table"><thead><tr><th>Hop</th><th>Host</th><th>Loss</th><th>Avg</th></tr></thead><tbody>';
+                    let html = '<table class="hop-table"><thead><tr><th>Hop</th><th>Host</th><th>Loss</th><th>Avg</th><th>Status</th></tr></thead><tbody>';
+                    let prevLoss = 0;
                     data.hops.forEach(h => {{
                         const loss = h.stats?.loss ?? 0;
                         const cls = loss > 20 ? 'high' : (loss > 5 ? 'med' : 'low');
-                        html += `<tr><td>${{h.hop}}</td><td>${{h.resolvedHost || h.resolvedAddress || '*'}}</td><td class="loss-cell ${{cls}}">${{loss.toFixed(1)}}%</td><td>${{h.stats?.avg?.toFixed(1) || '-'}} ms</td></tr>`;
+                        let status = '';
+                        if (loss > prevLoss + 10 && loss > 5) {{
+                            status = '<span style="color:#ef4444;font-size:0.65rem;">⚠ Bottleneck</span>';
+                            html += `<tr class="bottleneck">`;
+                        }} else {{
+                            html += `<tr>`;
+                        }}
+                        html += `<td>${{h.hop}}</td><td>${{h.resolvedHost || h.resolvedAddress || '*'}}</td><td class="loss-cell ${{cls}}">${{loss.toFixed(1)}}%</td><td>${{h.stats?.avg?.toFixed(1) || '-'}} ms</td><td>${{status}}</td></tr>`;
+                        prevLoss = loss;
                     }});
                     html += '</tbody></table>';
                     html += `<p style="margin-top:0.75rem;font-size:0.65rem;color:#404040;">Measurement ID: ${{data.measurement_id}} · <a href="https://globalping.io?measurement=${{data.measurement_id}}" target="_blank" style="color:#60a5fa;">View on Globalping</a></p>`;
                     body.innerHTML = html;
                 }} catch(e) {{ body.innerHTML = `<div class="spinner">Network error: ${{e.message}}</div>`; }}
             }}
+            async function runHttp(code, name) {{
+                const modal = document.getElementById('httpModal');
+                const title = document.getElementById('httpTitle');
+                const body = document.getElementById('httpBody');
+                title.textContent = `HTTP Timings from ${{name}} to {HTTP_TARGET}`;
+                body.innerHTML = '<div class="spinner">Running HTTP test... This may take up to 15s.</div>';
+                modal.classList.add('active');
+                try {{
+                    const resp = await fetch(`/api/http?country_code=${{code}}`);
+                    const data = await resp.json();
+                    if (data.error) {{ body.innerHTML = `<div class="spinner">Error: ${{data.error}}</div>`; return; }}
+                    const t = data.timings || {{}};
+                    let html = `<div class="http-grid">`;
+                    const metrics = [
+                        ['Total', t.total], ['DNS', t.dns], ['TCP', t.tcp],
+                        ['TLS', t.tls], ['First Byte', t.firstByte], ['Download', t.download]
+                    ];
+                    metrics.forEach(([label, val]) => {{
+                        html += `<div class="http-card"><div class="label">${{label}}</div><div class="value">${{val !== null && val !== undefined ? val + ' ms' : 'N/A'}}</div></div>`;
+                    }});
+                    html += `</div>`;
+                    html += `<p style="font-size:0.75rem;color:#737373;">HTTP Status: <strong style="color:#f5f5f5;">${{data.statusCode}}</strong></p>`;
+                    html += `<p style="margin-top:0.5rem;font-size:0.65rem;color:#404040;">Measurement ID: ${{data.measurement_id}} · <a href="https://globalping.io?measurement=${{data.measurement_id}}" target="_blank" style="color:#60a5fa;">View on Globalping</a></p>`;
+                    body.innerHTML = html;
+                }} catch(e) {{ body.innerHTML = `<div class="spinner">Network error: ${{e.message}}</div>`; }}
+            }}
             function closeModal() {{ document.getElementById('mtrModal').classList.remove('active'); }}
+            function closeHttpModal() {{ document.getElementById('httpModal').classList.remove('active'); }}
             document.getElementById('searchInput').addEventListener('input', applyFilter);
             document.getElementById('thresholdSelect').addEventListener('change', applyFilter);
             applyFilter();
