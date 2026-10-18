@@ -1,10 +1,14 @@
 import asyncio
 import json
+import os
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 import httpx
 
 app = FastAPI()
+
+# دریافت توکن از متغیرهای محیطی (برای افزایش محدودیت نرخ درخواست، توصیه می‌شود در Railway تنظیم شود)
+GLOBALPING_TOKEN = os.getenv("GLOBALPING_TOKEN", "")
 
 COUNTRIES = [
     {"name": "UAE", "code": "AE"}, {"name": "Turkey", "code": "TR"},
@@ -34,9 +38,19 @@ COUNTRIES = [
     {"name": "Romania", "code": "RO"}, {"name": "Hungary", "code": "HU"},
 ]
 
-TARGET = "8.8.8.8"
+# اصلاح کلیدی: هدف MTR باید نام دامنه باشد، نه IP
+PING_TARGET = "8.8.8.8"
+MTR_TARGET = "globalping.io"
 HTTP_TARGET = "https://www.google.com"
+
 SEMAPHORE = asyncio.Semaphore(5)
+
+def get_headers():
+    """ساخت هدر درخواست، در صورت وجود توکن آن را اضافه می‌کند"""
+    headers = {"Content-Type": "application/json"}
+    if GLOBALPING_TOKEN:
+        headers["Authorization"] = f"Bearer {GLOBALPING_TOKEN}"
+    return headers
 
 async def run_ping_from_country(client: httpx.AsyncClient, country_code: str):
     async with SEMAPHORE:
@@ -44,14 +58,17 @@ async def run_ping_from_country(client: httpx.AsyncClient, country_code: str):
             create_resp = await client.post(
                 "https://api.globalping.io/v1/measurements",
                 json={
-                    "target": TARGET,
+                    "target": PING_TARGET,
                     "type": "ping",
                     "locations": [{"country": country_code}],
                     "limit": 1,
                     "measurementOptions": {"packets": 3},
                 },
+                headers=get_headers(),
                 timeout=10.0,
             )
+            if create_resp.status_code == 429:
+                return {"error": "rate_limit"}
             if create_resp.status_code != 202:
                 return None
             measurement_id = create_resp.json()["id"]
@@ -59,6 +76,7 @@ async def run_ping_from_country(client: httpx.AsyncClient, country_code: str):
                 await asyncio.sleep(0.8)
                 get_resp = await client.get(
                     f"https://api.globalping.io/v1/measurements/{measurement_id}",
+                    headers=get_headers(),
                     timeout=8.0,
                 )
                 if get_resp.status_code == 200:
@@ -80,20 +98,22 @@ async def run_ping_from_country(client: httpx.AsyncClient, country_code: str):
 
 @app.get("/api/mtr")
 async def run_mtr(country_code: str):
-    """MTR: حذف measurementOptions برای جلوگیری از خطای اعتبارسنجی"""
+    """MTR: هدف نام دامنه است تا از خطای اعتبارسنجی جلوگیری شود"""
     async with httpx.AsyncClient() as client:
         try:
             create_resp = await client.post(
                 "https://api.globalping.io/v1/measurements",
                 json={
-                    "target": TARGET,
+                    "target": MTR_TARGET,
                     "type": "mtr",
                     "locations": [{"country": country_code}],
                     "limit": 1,
-                    # بدون measurementOptions، API از مقادیر پیش‌فرض استفاده می‌کند
                 },
+                headers=get_headers(),
                 timeout=10.0,
             )
+            if create_resp.status_code == 429:
+                return JSONResponse({"error": "Rate limit exceeded. Add GLOBALPING_TOKEN to increase limits."}, status_code=429)
             if create_resp.status_code != 202:
                 err = create_resp.text
                 return JSONResponse({"error": f"Create failed: {err}"}, status_code=400)
@@ -102,6 +122,7 @@ async def run_mtr(country_code: str):
                 await asyncio.sleep(1.0)
                 get_resp = await client.get(
                     f"https://api.globalping.io/v1/measurements/{mid}",
+                    headers=get_headers(),
                     timeout=10.0,
                 )
                 if get_resp.status_code == 200:
@@ -132,8 +153,11 @@ async def run_http(country_code: str):
                         "request": {"method": "GET"}
                     }
                 },
+                headers=get_headers(),
                 timeout=10.0,
             )
+            if create_resp.status_code == 429:
+                return JSONResponse({"error": "Rate limit exceeded. Add GLOBALPING_TOKEN to increase limits."}, status_code=429)
             if create_resp.status_code != 202:
                 err = create_resp.text
                 return JSONResponse({"error": f"Create failed: {err}"}, status_code=400)
@@ -142,6 +166,7 @@ async def run_http(country_code: str):
                 await asyncio.sleep(1.0)
                 get_resp = await client.get(
                     f"https://api.globalping.io/v1/measurements/{mid}",
+                    headers=get_headers(),
                     timeout=10.0,
                 )
                 if get_resp.status_code == 200:
@@ -167,8 +192,12 @@ async def dashboard():
         results = await asyncio.gather(*tasks)
 
     rows_data = []
+    rate_limited = False
     for country, res in zip(COUNTRIES, results):
-        if res and res["loss"] is not None:
+        if res and res.get("error") == "rate_limit":
+            rate_limited = True
+            rows_data.append({"name": country["name"], "code": country["code"], "loss": None, "min": None, "avg": None, "max": None, "share_id": None})
+        elif res and res["loss"] is not None:
             rows_data.append({
                 "name": country["name"], "code": country["code"],
                 "loss": round(res["loss"], 2),
@@ -222,6 +251,7 @@ async def dashboard():
     losses_json = json.dumps(losses)
     worst_name = worst["name"] if worst else "—"
     worst_val = f"{worst['loss']:.1f}%" if worst else "—"
+    rate_limit_banner = '<div style="background:#7f1d1d;color:#fca5a5;padding:0.5rem 1.5rem;font-size:0.75rem;">⚠️ Rate limit exceeded. Add GLOBALPING_TOKEN environment variable to increase limits.</div>' if rate_limited else ''
 
     html = f"""
     <!DOCTYPE html>
@@ -302,11 +332,12 @@ async def dashboard():
             <header>
                 <h1>PACKET LOSS</h1>
                 <div class="meta">
-                    <span>TARGET {TARGET}</span>
+                    <span>TARGET {PING_TARGET}</span>
                     <span>PROBES {len(valid)}/{len(COUNTRIES)}</span>
                     <span class="logic">BUILT BY LOGIC</span>
                 </div>
             </header>
+            {rate_limit_banner}
             <div class="filters">
                 <input type="text" id="searchInput" placeholder="Search country...">
                 <select id="thresholdSelect">
@@ -403,7 +434,7 @@ async def dashboard():
                 const modal = document.getElementById('mtrModal');
                 const title = document.getElementById('modalTitle');
                 const body = document.getElementById('modalBody');
-                title.textContent = `MTR from ${{name}} to {TARGET}`;
+                title.textContent = `MTR from ${{name}} to {MTR_TARGET}`;
                 body.innerHTML = '<div class="spinner">Running MTR... This may take up to 20s.</div>';
                 modal.classList.add('active');
                 try {{
@@ -470,4 +501,6 @@ async def dashboard():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Railway به صورت خودکار متغیر PORT را تزریق می‌کند
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
